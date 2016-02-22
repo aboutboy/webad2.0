@@ -41,6 +41,8 @@ enum http_strings {
 	SEARCH_IS_CHUNKED,
 	SEARCH_CHUNKED_VALUE_START,
 	SEARCH_CHUNKED_VALUE_STOP,
+	SEARCH_CONTENT_LEN_VALUE_START,
+	SEARCH_CONTENT_LEN_VALUE_STOP,
 };
 
 static struct {
@@ -53,8 +55,8 @@ static struct {
 		.len	= 4 ,
 	},
 	[SEARCH_RESPONSE] = {
-		.string	= "HTTP/1. ",
-		.len	= 7,
+		.string	= "HTTP/1.1 200 OK",
+		.len	= 15,
 	},
 	[SEARCH_ACCEPT_ENCODING] = {
 		.string	= "Accept-Encoding: gzip ",
@@ -89,6 +91,14 @@ static struct {
 		.len	= 4,
 	},
 	[SEARCH_CHUNKED_VALUE_STOP] = {
+		.string	= "\r\n",
+		.len	= 2,
+	},
+	[SEARCH_CONTENT_LEN_VALUE_START] = {
+		.string	= "Content-Length: ",
+		.len	= 16,
+	},
+	[SEARCH_CONTENT_LEN_VALUE_STOP] = {
 		.string	= "\r\n",
 		.len	= 2,
 	},
@@ -148,6 +158,11 @@ static int http_help(struct sk_buff *skb,
 	struct ts_state ts;
 	unsigned int dataoff, matchoff;
 
+    if (0 != skb_linearize(skb))
+	{
+		printk(" !!! skb_linearize error\n");
+		return NF_ACCEPT;
+	}
 	//no need , kernel repair auto
 	//http_repair_packet(skb, ct, ctinfo,protoff);
 	
@@ -274,9 +289,9 @@ static void change_package(struct sk_buff *skb,
 	struct ts_state ts;
     struct tcphdr* tcph;
 	unsigned int dataoff, matchoff,matchoff_start,matchoff_stop;
-	char src_hex[32],dst_hex[32];
-	unsigned int hex_i;
-
+	char src[32]={0},dst[32]={0};
+	unsigned int tmp;
+    //printk(KERN_INFO "yjjtest~~~~start\n");
     tcph = (struct tcphdr *)((char*)ip_hdr(skb)+protoff);
 	dataoff = protoff + (tcph->doff<<2);
     
@@ -297,7 +312,7 @@ static void change_package(struct sk_buff *skb,
 				return;
 		}
 	}
-    //printk("~~~~%s\n" , (char*)ip_hdr(skb)+dataoff);
+    //printk(KERN_INFO "yjjtest~~~~start_insert:%s\n" , (char*)ip_hdr(skb)+dataoff);
 	if(!http_merge_packet(skb, ct, ctinfo,protoff,
 				   matchoff, 0,
 				   JS, JS_LEN))
@@ -307,8 +322,40 @@ static void change_package(struct sk_buff *skb,
 	matchoff = skb_find_text(skb, dataoff, skb->len,
 			  search[SEARCH_IS_CHUNKED].ts, &ts);
 	if (matchoff == UINT_MAX)
-		return;
+	{
+        memset(&ts, 0, sizeof(ts));
+    	matchoff_start = skb_find_text(skb, dataoff, skb->len,
+    			  search[SEARCH_CONTENT_LEN_VALUE_START].ts, &ts);
+    	if (matchoff_start == UINT_MAX)
+    	{
+            return;
+        }
+        
+        //printk(KERN_INFO "yjjtest~~~~start change content len\n");
+        matchoff_start += search[SEARCH_CONTENT_LEN_VALUE_START].len;
+        memset(&ts, 0, sizeof(ts));
+    	matchoff_stop = skb_find_text(skb, dataoff+matchoff_start, skb->len,
+    			  search[SEARCH_CONTENT_LEN_VALUE_STOP].ts, &ts);
+    	if (matchoff_stop == UINT_MAX)
+    		return;
 
+    	if(matchoff_stop > 8)
+    	{
+    		return;
+    	}
+        memcpy(src , (char*)ip_hdr(skb)+dataoff+matchoff_start , matchoff_stop);
+    	sscanf(src, "%d", &tmp);
+    	tmp +=JS_LEN;
+    	sprintf(dst, "%d" , tmp);
+    	//printk(KERN_INFO "yjjtest~~~~~end change content len:%s---%s\n" , src , dst);
+
+    	http_merge_packet(skb, ct, ctinfo,protoff,
+    				   matchoff_start, matchoff_stop,
+    				   dst, strlen(dst));
+        //printk(KERN_INFO "yjjtest~~~~~end:%s\n" , (char*)ip_hdr(skb)+dataoff);
+        return;
+    }
+    //printk(KERN_INFO "yjjtest~~~~start change chunked\n");
 	memset(&ts, 0, sizeof(ts));
 	matchoff_start = skb_find_text(skb, dataoff, skb->len,
 			  search[SEARCH_CHUNKED_VALUE_START].ts, &ts);
@@ -328,17 +375,17 @@ static void change_package(struct sk_buff *skb,
 		return;
 	}
 	
-	memcpy(src_hex , (char*)ip_hdr(skb)+dataoff+matchoff_start , matchoff_stop);
-	sscanf(src_hex, "%x", &hex_i);
-	hex_i+=JS_LEN;
-	sprintf(dst_hex , "%x" , hex_i);
-	//printk("%s---%s\n" , src_hex , dst_hex);
+	memcpy(src , (char*)ip_hdr(skb)+dataoff+matchoff_start , matchoff_stop);
+	sscanf(src, "%x", &tmp);
+	tmp+=JS_LEN;
+	sprintf(dst , "%x" , tmp);
+	//printk(KERN_INFO "yjjtest~~~~~end change chunked:%s---%s\n" , src , dst);
 
 	http_merge_packet(skb, ct, ctinfo,protoff,
 				   matchoff_start, matchoff_stop,
-				   dst_hex, strlen(dst_hex));
+				   dst, strlen(dst));
 	
-	//printk("%s\n" , (char*)ip_hdr(skb)+dataoff+matchoff_start);
+	//printk(KERN_INFO "yjjtest~~~~~end:%s\n" , (char*)ip_hdr(skb)+dataoff);
 
 }
 
