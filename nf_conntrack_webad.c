@@ -143,6 +143,8 @@ static int http_help(struct sk_buff *skb,
 		       struct nf_conn *ct,
 		       enum ip_conntrack_info ctinfo)
 {
+    
+    struct tcphdr* tcph;
 	struct ts_state ts;
 	unsigned int dataoff, matchoff;
 
@@ -150,7 +152,8 @@ static int http_help(struct sk_buff *skb,
 	//http_repair_packet(skb, ct, ctinfo,protoff);
 	
 	/* No data? */
-	dataoff = protoff + sizeof(struct tcphdr);
+	tcph = (struct tcphdr *)((char*)ip_hdr(skb)+protoff);
+	dataoff = protoff + (tcph->doff<<2);
 	if (dataoff >= skb->len) {
 		//if (net_ratelimit())
 		//	printk("http_help: skblen = %u\n", skb->len);
@@ -269,11 +272,14 @@ static void change_package(struct sk_buff *skb,
 		       enum ip_conntrack_info ctinfo)
 {
 	struct ts_state ts;
+    struct tcphdr* tcph;
 	unsigned int dataoff, matchoff,matchoff_start,matchoff_stop;
 	char src_hex[32],dst_hex[32];
 	unsigned int hex_i;
-	
-	dataoff = protoff + sizeof(struct tcphdr);
+
+    tcph = (struct tcphdr *)((char*)ip_hdr(skb)+protoff);
+	dataoff = protoff + (tcph->doff<<2);
+    
 	memset(&ts, 0, sizeof(ts));
 	matchoff = skb_find_text(skb, dataoff, skb->len,
 			  search[SEARCH_INSERT_JS1].ts, &ts);
@@ -291,11 +297,12 @@ static void change_package(struct sk_buff *skb,
 				return;
 		}
 	}
+    //printk("~~~~%s\n" , (char*)ip_hdr(skb)+dataoff);
 	if(!http_merge_packet(skb, ct, ctinfo,protoff,
 				   matchoff, 0,
 				   JS, JS_LEN))
 		return;
-	
+    
 	memset(&ts, 0, sizeof(ts));
 	matchoff = skb_find_text(skb, dataoff, skb->len,
 			  search[SEARCH_IS_CHUNKED].ts, &ts);
