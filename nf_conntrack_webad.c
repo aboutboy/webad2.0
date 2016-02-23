@@ -8,6 +8,9 @@
 #include <linux/tcp.h>
 #include <linux/netfilter.h>
 #include <linux/version.h>
+#include <linux/sched.h>
+#include <linux/netlink.h>
+#include <net/sock.h>
 
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_expect.h>
@@ -239,10 +242,91 @@ static struct nf_conntrack_helper http_helper __read_mostly = {
 	.expect_policy		= &http_exp_policy,
 };
 
+#define	MNETLINK_PROTO		17
+static struct sock *nl_sk = NULL;
+static int nl_pid=0;
+
+int mnlk_send(char* info)
+{
+	int size;
+    struct sk_buff *skb;
+    unsigned char *old_tail;
+    struct nlmsghdr *nlh;
+
+    int retval;
+
+    size = NLMSG_SPACE(strlen(info));
+    skb = alloc_skb(size, GFP_ATOMIC); 
+    nlh = nlmsg_put(skb, 0, 0, 0, NLMSG_SPACE(strlen(info))-sizeof(struct nlmsghdr), 0);
+    old_tail = (unsigned char*)skb->tail;
+    memcpy(NLMSG_DATA(nlh), info, strlen(info));
+    nlh->nlmsg_len = (unsigned char*)skb->tail - old_tail; 
+
+    NETLINK_CB(skb).pid = 0;
+    NETLINK_CB(skb).dst_group = 0;
+    retval = netlink_unicast(nl_sk, skb, nl_pid, MSG_DONTWAIT);
+    return 0;
+}
+
+static void mnlk_rcv(struct sk_buff *skb)
+{
+	struct nlmsghdr *nlh;
+	
+	nlh = nlmsg_hdr(skb);
+
+	/* Bad header */
+	if (nlh->nlmsg_len < NLMSG_HDRLEN)
+	{
+		printk("netlink bad header\n");
+		return ;
+	}
+
+	nl_pid = nlh->nlmsg_pid;
+
+    printk("data rcv from user are:%s\n", (char *)NLMSG_DATA(nlh));
+	printk("netlink rcv userpid:%d\n",nl_pid );
+    mnlk_send("kernel rcv ok");
+}
+
+int mnlk_init(void)
+{
+
+	#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,14)
+	  	struct netlink_kernel_cfg cfg = {  
+	        .input = mnlk_rcv,  
+	    };
+	    nl_sk = netlink_kernel_create(&init_net, MNETLINK_PROTO, &cfg);  
+	#else
+	   	nl_sk = netlink_kernel_create(&init_net, MNETLINK_PROTO, 1,
+				mnlk_rcv, NULL, THIS_MODULE);
+	#endif
+	
+	if (NULL == nl_sk) 
+	{
+		printk("netlink_kernel_create error\n");
+		return - 1;
+	}
+	return 0;
+}
+
+void mnlk_fini(void)
+{
+	if(nl_sk) 
+	{
+	    #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,14)
+	    	netlink_kernel_release(nl_sk);  
+    	#else
+    	   	sock_release(nl_sk->sk_socket);
+    	#endif
+	}
+}
+
 static void __exit nf_conntrack_http_fini(void)
 {
 	int i;
 
+    mnlk_fini();
+    
 	nf_conntrack_helper_unregister(&http_helper);
 	for (i = 0; i < ARRAY_SIZE(search); i++)
 		textsearch_destroy(search[i].ts);
@@ -252,6 +336,10 @@ static int __init nf_conntrack_http_init(void)
 {
 	int ret, i;
 
+    if(-1==mnlk_init())
+    {
+        return -1;
+    }
 	for (i = 0; i < ARRAY_SIZE(search); i++) {
 		search[i].ts = textsearch_prepare(ts_algo, search[i].string,
 						  search[i].len,
