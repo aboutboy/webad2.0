@@ -242,7 +242,7 @@ static struct nf_conntrack_helper http_helper __read_mostly = {
 	.expect_policy		= &http_exp_policy,
 };
 
-#define	MNETLINK_PROTO		17
+#define	MNETLINK_PROTO		31
 static struct sock *nl_sk = NULL;
 static int nl_pid=0;
 
@@ -262,7 +262,6 @@ int mnlk_send(char* info)
     memcpy(NLMSG_DATA(nlh), info, strlen(info));
     nlh->nlmsg_len = (unsigned char*)skb->tail - old_tail; 
 
-    NETLINK_CB(skb).pid = 0;
     NETLINK_CB(skb).dst_group = 0;
     retval = netlink_unicast(nl_sk, skb, nl_pid, MSG_DONTWAIT);
     return 0;
