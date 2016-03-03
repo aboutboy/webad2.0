@@ -28,3 +28,7 @@ netfilter
 编译安装
 1、在android根目录执行make命令
 2、将编译出来的文件进行刷机
+3、报错No rule to make target `include/config/auto.conf', needed by `include/config/kernel.release'.  Stop.
+解决方法：可以在根目录先执行make clean清空再执行make编译
+	  可以添加CONFIG_NF_CONNTRACK_WEBAD=y到./out/target/product/zaw1055q_mmx_ru/obj/KERNEL_OBJ/include/config/auto.conf
+	  可以直接到./out/target/product/zaw1055q_mmx_ru/obj/KERNEL_OBJ目录执行make menuconfig配置
